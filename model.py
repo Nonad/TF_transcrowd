@@ -62,7 +62,7 @@ class Attention(keras.layers.Layer):
         xperm = np.arange(2, xsize, 1)
         xperm = np.insert(xperm, 1, 1)
         xperm = np.insert(xperm, 0, 0)
-        x = tf.convert_to_tensor(np.reshape(np.array(tf.transpose(x, perm=xperm)), (B, N, C)))
+        x = tf.convert_to_tensor(np.reshape(np.array(tf.transpose(x, perm=xperm)), (B, N, C)))  # not elegant I know
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -100,4 +100,16 @@ class VisionTransformer(layers.Layer):
         self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token =
+        self.cls_token = tf.Variable(tf.zeros(1, 1, embed_dim), trainable=True)  # nn.Parameter
+        self.dist_token = tf.Variable(tf.zeros(1, 1, embed_dim), trainable=True) if distilled else None
+        self.pos_embed = tf.Variable(tf.zeros(1, num_patches + self.num_tokens, embed_dim), trainable=True)
+        self.pos_drop = layers.Dropout(drop_rate)
+
+        dpr = [x.numpy()[0] for x in tf.linspace(0, drop_path_rate, depth)]  # tried to replace x.item()
+        self.blocks = tf.keras.Sequential(*[
+            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
+                  attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
+            for i in range(depth)])
+        self.norm = layers.LayerNormalization(embed_dim)
+
+        
