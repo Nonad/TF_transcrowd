@@ -3,7 +3,8 @@ import tensorflow as tf
 from tensorflow.keras import layers
 from itertools import repeat
 import collections.abc
-
+import math
+import warnings
 
 def _ntuple(n):
     def parse(x):
@@ -86,3 +87,30 @@ class PatchEmbed(layers.Layer):
             x = tf.transpose(x, perm=xperm)
         x = self.norm(x)
         return x
+
+# timm/models/layers/weight_init.py
+# def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+#     # (tensor, float, float, float, float) -> tensor
+#     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
+#
+# def _no_grad_trunc_normal_(tensor, mean, std, a, b):
+#     def norm_cdf(x):
+#         return (1. + math.erf(x / math.sqrt(2.))) / 2.
+#
+#     if(mean < a - 2 * std) or (mean > b + 2 * std):
+#         warnings.warn("mean is more than 2 std from [a, b] in nn.init.trunc_normal_. "
+#                       "The distribution of values may be incorrect.",
+#                       stacklevel=2)
+#
+#     with tf.GradientTape(watch_accessed_variables=False) as tape:
+#         l = norm_cdf((a - mean) / std)
+#         u = norm_cdf((b - mean) / std)
+#
+#         tensor = tf.random.uniform(tensor.shape, 2 * l - 1, 2 * u - 1, Dtype=tf.float32)
+#
+#         tensor = tf.math.erfinv(tensor)
+#
+#         tensor = tf.add(tf.multiply(tensor, std * math.sqrt(2.)), mean)
+#
+#         tensor = tf.clip_by_value(tensor, min=a, max=b)
+#         return tensor
