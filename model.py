@@ -3,7 +3,7 @@ import collections
 import keras.layers
 import numpy as np
 import math
-from .helper import named_apply
+from .helper import named_apply, adapt_input_conv
 from .register import register_model
 from .layer import Mlp, DropPath, PatchEmbed
 import tensorflow as tf
@@ -153,14 +153,56 @@ class VisionTransformer(layers.Layer):
         # this fn left here for compat with downstream users
         _init_vit_weights(m)
 
+    def load_pretrained(self, checkpoint_path, prefix=''):
+        _load_weights(self, checkpoint_path, prefix)
 
+    def no_weight_decay(self):
+        return {'pos_embed', 'cls_token', 'dist_token'}
 
+    def get_classifier(self):
+        if self.dist_token is None:
+            return self.head
+        else:
+            return self.head, self.head_dist
 
-        # line 313~363
+    def reset_classifier(self, num_classes, global_pool=''):
+        self.num_classes = num_classes
+        self.head = layers.Dense(num_classes, activation=None, input_shape=(self.embed_dim, )) if num_classes > 0 else tf.identity()
+        if self.num_tokens == 2:
+            self.head_dist = layers.Dense(self.num_classes, activation=None, input_shape=(self.embed_dim, )) if num_classes > 0 else tf.identity()
 
+    def forward_features(self, x):
+        x = self.patch_embed(x)
+        li = np.ones(np.array(self.cls_token.shape).shape[0], dtype=int)
+        li[0] = 2
+        cls_token = tf.tile(tf.expand_dims(tf.Variable(self.cls_token), 0), tuple(li))
+        # awful... 3 lines for torch.expand
+        if self.dist_token is None:
+            x = tf.concat((cls_token, x), axis=1)
+        else:
+            li = np.ones(np.array(self.dist_token.shape).shape[0], dtype=int)
+            li[0] = 2
+            dist_token = tf.tile(tf.expand_dims(tf.Variable(self.dist_token), 0), tuple(li))
+            x = tf.concat((cls_token, dist_token, x), axis=1)
+        x = self.pos_drop(x + self.pos_embed)
+        x = self.blocks(x)
+        x = self.norm(x)
+        if self.dist_token is None:
+            return self.pre_logits(x[:, 0])
+        else:
+            return x[:, 0], x[:, 1]
 
-
-
+    def forward(self, x):
+        x = self.forward_features(x)
+        if self.head_dist is not None:
+            x, x_dist = self.head(x[0]), self.head_dist(x[1])
+            if self.training : # and not torch.jit.is_scripting()???
+                return x, x_dist
+            else:
+                return (x + x_dist) / 2
+        else:
+            x = self.head(x)
+        return x
 
 
 def _init_vit_weights(module: layers.Layer, name: str = '', head_bias: float = 0., jax_impl: bool = False):
@@ -195,5 +237,77 @@ def _init_vit_weights(module: layers.Layer, name: str = '', head_bias: float = 0
         module.weight = tf.Variable(tf.initializers.Ones()(shape=module.weight.shape))
 
 
+with tf.GradientTape(watch_accessed_variables=False) as tape:
+    def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = ''):
+        def _n2p(w, t=True):
+            if tf.constant(w).ndim == 4 and w.shape[0] == w.shape[1] ==w.shape[2] == 1:
+                w = tf.reshape(w, [-1])
+            if t:
+                if tf.constant(w).ndim == 4:
+                    w = tf.transpose(w, [3, 2, 0, 1])
+                elif tf.constant(w).ndim == 3:
+                    w = tf.transpose(w, [2, 0, 1])
+                elif tf.constant(w).ndim == 2:
+                    w = tf.transpose(w, [1, 0])
+            return tf.convert_to_tensor(w)
 
+        w = np.load(checkpoint_path)
+        if not prefix and 'opt/target/embedding/kernel' in w:
+            prefix = 'opt/target/'
+
+        if hasattr(model.patch_embed, 'backbone'):
+            backbone = model.patch_embed.backbone
+            stem_only = not hasattr(backbone, 'stem')
+            stem = backbone if stem_only else backbone.stem
+            stem.conv.weight.copy_(adapt_input_conv(stem.conv.weight.shape[1], _n2p(w[f'{prefix}conv_root/kernel'])))
+            stem.norm.weight.copy_(_n2p(w[f'{prefix}gn_root/scale']))
+            stem.norm.bias.copy_(_n2p(w[f'{prefix}gn_root/bias']))
+            if not stem_only:
+                for i, stage in enumerate(backbone.stages):
+                    for j, block in enumerate(stage.blocks):
+                        bp = f'{prefix}block{i + 1}/unit{j + 1}/'
+                        for r in range(3):
+                            getattr(block, f'conv{r + 1}').weight.copy_(_n2p(w[f'{bp}conv{r + 1}/kernel']))
+                            getattr(block, f'norm{r + 1}').weight.copy_(_n2p(w[f'{bp}gn{r + 1}/scale']))
+                            getattr(block, f'norm{r + 1}').bias.copy_(_n2p(w[f'{bp}gn{r + 1}/bias']))
+                        if block.downsample is not None:
+                            block.downsample.conv.weight.copy_(_n2p(w[f'{bp}conv_proj/kernel']))
+                            block.downsample.norm.weight.copy_(_n2p(w[f'{bp}gn_proj/scale']))
+                            block.downsample.norm.bias.copy_(_n2p(w[f'{bp}gn_proj/bias']))
+            embed_conv_w = _n2p(w[f'{prefix}embedding/kernel'])
+        else:
+            embed_conv_w = adapt_input_conv(
+                model.patch_embed.proj.weight.shape[1], _n2p(w[f'{prefix}embedding/kernel']))
+        model.patch_embed.proj.weight.copy_(embed_conv_w)
+        model.patch_embed.proj.bias.copy_(_n2p(w[f'{prefix}embedding/bias']))
+        model.cls_token.copy_(_n2p(w[f'{prefix}cls'], t=False))
+        pos_embed_w = _n2p(w[f'{prefix}Transformer/posembed_input/pos_embedding'], t=False)
+        if pos_embed_w.shape != model.pos_embed.shape:
+            pos_embed_w = resize_pos_embed(  # resize pos embedding when different size from pretrained weights
+                pos_embed_w, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
+        model.pos_embed.copy_(pos_embed_w)
+        model.norm.weight.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/scale']))
+        model.norm.bias.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/bias']))
+        if isinstance(model.head, nn.Linear) and model.head.bias.shape[0] == w[f'{prefix}head/bias'].shape[-1]:
+            model.head.weight.copy_(_n2p(w[f'{prefix}head/kernel']))
+            model.head.bias.copy_(_n2p(w[f'{prefix}head/bias']))
+        if isinstance(getattr(model.pre_logits, 'fc', None), nn.Linear) and f'{prefix}pre_logits/bias' in w:
+            model.pre_logits.fc.weight.copy_(_n2p(w[f'{prefix}pre_logits/kernel']))
+            model.pre_logits.fc.bias.copy_(_n2p(w[f'{prefix}pre_logits/bias']))
+        for i, block in enumerate(model.blocks.children()):
+            block_prefix = f'{prefix}Transformer/encoderblock_{i}/'
+            mha_prefix = block_prefix + 'MultiHeadDotProductAttention_1/'
+            block.norm1.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/scale']))
+            block.norm1.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/bias']))
+            block.attn.qkv.weight.copy_(torch.cat([
+                _n2p(w[f'{mha_prefix}{n}/kernel'], t=False).flatten(1).T for n in ('query', 'key', 'value')]))
+            block.attn.qkv.bias.copy_(torch.cat([
+                _n2p(w[f'{mha_prefix}{n}/bias'], t=False).reshape(-1) for n in ('query', 'key', 'value')]))
+            block.attn.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
+            block.attn.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
+            for r in range(2):
+                getattr(block.mlp, f'fc{r + 1}').weight.copy_(_n2p(w[f'{block_prefix}MlpBlock_3/Dense_{r}/kernel']))
+                getattr(block.mlp, f'fc{r + 1}').bias.copy_(_n2p(w[f'{block_prefix}MlpBlock_3/Dense_{r}/bias']))
+            block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/scale']))
+            block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/bias']))
 
