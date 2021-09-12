@@ -3,6 +3,7 @@ import collections
 import keras.layers
 import numpy as np
 import math
+import logging
 from .helper import named_apply, adapt_input_conv
 from .register import register_model
 from .layer import Mlp, DropPath, PatchEmbed
@@ -19,6 +20,8 @@ IMAGENET_DPN_MEAN = (124 / 255, 117 / 255, 104 / 255)
 IMAGENET_DPN_STD = tuple([1 / (.0167 * 255)] * 3)
 
 
+_logger = logging.getLogger(__name__)
+
 # timm/data/constants.py
 
 def _cfg(url='', **kwargs):
@@ -33,6 +36,9 @@ def _cfg(url='', **kwargs):
 
 
 # 'default_cfgs'     is used in     register
+
+
+
 
 class Attention(keras.layers.Layer):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
@@ -240,7 +246,7 @@ def _init_vit_weights(module: layers.Layer, name: str = '', head_bias: float = 0
 with tf.GradientTape(watch_accessed_variables=False) as tape:
     def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = ''):
         def _n2p(w, t=True):
-            if tf.constant(w).ndim == 4 and w.shape[0] == w.shape[1] ==w.shape[2] == 1:
+            if tf.constant(w).ndim == 4 and w.shape[0] == w.shape[1] == w.shape[2] == 1:
                 w = tf.reshape(w, [-1])
             if t:
                 if tf.constant(w).ndim == 4:
@@ -288,10 +294,10 @@ with tf.GradientTape(watch_accessed_variables=False) as tape:
         model.pos_embed.copy_(pos_embed_w)
         model.norm.weight.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/scale']))
         model.norm.bias.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/bias']))
-        if isinstance(model.head, nn.Linear) and model.head.bias.shape[0] == w[f'{prefix}head/bias'].shape[-1]:
+        if isinstance(model.head, layers.Dense) and model.head.bias.shape[0] == w[f'{prefix}head/bias'].shape[-1]:
             model.head.weight.copy_(_n2p(w[f'{prefix}head/kernel']))
             model.head.bias.copy_(_n2p(w[f'{prefix}head/bias']))
-        if isinstance(getattr(model.pre_logits, 'fc', None), nn.Linear) and f'{prefix}pre_logits/bias' in w:
+        if isinstance(getattr(model.pre_logits, 'fc', None), layers.Dense) and f'{prefix}pre_logits/bias' in w:
             model.pre_logits.fc.weight.copy_(_n2p(w[f'{prefix}pre_logits/kernel']))
             model.pre_logits.fc.bias.copy_(_n2p(w[f'{prefix}pre_logits/bias']))
         for i, block in enumerate(model.blocks.children()):
@@ -299,9 +305,9 @@ with tf.GradientTape(watch_accessed_variables=False) as tape:
             mha_prefix = block_prefix + 'MultiHeadDotProductAttention_1/'
             block.norm1.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/scale']))
             block.norm1.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/bias']))
-            block.attn.qkv.weight.copy_(torch.cat([
+            block.attn.qkv.weight.copy_(tf.concat([
                 _n2p(w[f'{mha_prefix}{n}/kernel'], t=False).flatten(1).T for n in ('query', 'key', 'value')]))
-            block.attn.qkv.bias.copy_(torch.cat([
+            block.attn.qkv.bias.copy_(tf.concat([
                 _n2p(w[f'{mha_prefix}{n}/bias'], t=False).reshape(-1) for n in ('query', 'key', 'value')]))
             block.attn.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
             block.attn.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
@@ -311,3 +317,29 @@ with tf.GradientTape(watch_accessed_variables=False) as tape:
             block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/scale']))
             block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/bias']))
 
+def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
+    # Rescale the grid of position embeddings when loading from state_dict. Adapted from
+    # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
+    _logger.info('Resized position embedding: %s to %s', posemb.shape, posemb_new.shape)
+    ntok_new = posemb_new.shape[1]
+    if num_tokens:
+        posemb_tok, posemb_grid = posemb[:, :num_tokens], posemb[0, num_tokens:]
+        ntok_new -= num_tokens
+    else:
+        posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+    gs_old = int(math.sqrt(len(posemb_grid)))
+    if not len(gs_new):  # backwards compatibility
+        gs_new = [int(math.sqrt(ntok_new))] * 2
+    assert len(gs_new) >= 2
+    _logger.info('Position embedding grid-size from %s to %s', [gs_old, gs_old], gs_new)
+    posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
+    # posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode='bicubic', align_corners=False)
+    posemb_grid = tf.image.resize(posemb_grid, size=gs_new, method='bicubic')
+    posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, gs_new[0] * gs_new[1], -1)
+    posemb = tf.concat([posemb_tok, posemb_grid], dim=1)
+    return posemb
+
+
+class VisionTransformer_token(VisionTransformer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
