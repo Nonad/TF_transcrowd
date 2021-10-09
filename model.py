@@ -40,6 +40,7 @@ def _cfg(url='', **kwargs):
 
 
 
+
 class Attention(keras.layers.Layer):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -180,9 +181,10 @@ class VisionTransformer(layers.Layer):
     def forward_features(self, x):
         x = self.patch_embed(x)
         li = np.ones(np.array(self.cls_token.shape).shape[0], dtype=int)
-        li[0] = 2
+        li[0] = x.shape[0]  # 091021
         cls_token = tf.tile(tf.expand_dims(tf.Variable(self.cls_token), 0), tuple(li))
         # awful... 3 lines for torch.expand
+        # 091021  so idiot that forgot x.shape[0] and li[0]=2
         if self.dist_token is None:
             x = tf.concat((cls_token, x), axis=1)
         else:
@@ -343,3 +345,117 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
 class VisionTransformer_token(VisionTransformer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        num_patches = self.patch_embed.num_patches
+        self.pos_embed = tf.Variable(tf.zeros(1, num_patches+1, self.embed_dim), trainable=True)  # nn.Parameter
+        self.pos_embed = tf.Variable(tf.random.truncated_normal(shape=self.pos_embed.shape, stddev=.02))
+        # trunc_normal_(self.pos_embed, std=.02)
+
+        self.output1 = keras.Sequential(
+            layers.ReLU(),
+            layers.Dropout(0.5),
+            layers.Dense(1, activation=None, input_shape=(1000,))
+        )
+        self.output1.apply(self._init_weights)
+
+    def forward_features(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        li = np.ones(np.array(self.cls_token.shape).shape[0], dtype=int)
+        li[0] = B
+        cls_token = tf.tile(tf.expand_dims(tf.Variable(self.cls_token), 0), tuple(li))
+        # also for torch.expand
+        x = tf.concat((cls_token, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        return x[:, 0]
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        x = self.output1(x)
+        return x
+
+
+class VisionTransformer_gap(VisionTransformer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        num_patches = self.patch_embed.num_patches
+        self.pos_embed = tf.Variable(tf.zeros(1, num_patches+1, self.embed_dim), trainable=True)  # nn.Parameter
+        self.pos_embed = tf.Variable(tf.random.truncated_normal(shape=self.pos_embed.shape, stddev=.02))
+        # trunc_normal_(self.pos_embed, std=.02)
+
+        self.output1 = keras.Sequential(
+            layers.ReLU(),
+            layers.Dense(128, input_shape=(6912 * 4,)),
+            layers.ReLU(),
+            layers.Dropout(0.5),
+            layers.Dense(1, input_shape=(128,))
+        )
+        self.output1.apply(self._init_weights)
+
+        def forward_features(self, x):
+            B = x.shape[0]
+            x = self.patch_embed(x)
+
+            li = np.ones(np.array(self.cls_token.shape).shape[0], dtype=int)
+            li[0] = B
+            cls_token = tf.tile(tf.expand_dims(tf.Variable(self.cls_token), 0), tuple(li))
+            # also for torch.expand
+            x = tf.concat((cls_token, x), dim=1)
+            x = x + self.pos_embed
+            x = self.pos_drop(x)
+
+            for blk in self.blocks:
+                x = blk(x)
+
+            x = self.norm(x)
+            return x[:, 1:]
+
+        def forward(self, x):
+            x = self.forward_features(x)
+            stride = x.shape[2]/48
+            x = tf.nn.avg_pool1d(x, ksize=tuple(x.shape[2]-47*stride), strides=stride, padding='VALID')
+            # thanks for https://www.zhihu.com/question/297035471
+            x = tf.reshape(x, (x.shape[0], -1))
+            x = self.output1(x)
+            return x
+
+
+@register_model
+def base_patch16_384_token(pretrained=False, **kwargs):
+    model = VisionTransformer_token(
+        img_size=384, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(layers.LayerNormalization(), eps=1e-6), **kwargs)
+    model.default_cfg = _cfg()
+    # if pretrained:
+    #     '''download from https://dl.fbaipublicfiles.com/deit/deit_base_patch16_384-8de9b5d1.pth'''
+    #     checkpoint = torch.load(
+    #         './Networks/deit_base_patch16_384-8de9b5d1.pth')
+    #     model.load_state_dict(checkpoint["model"], strict=False)
+    #     print("load transformer pretrained")
+    return model
+
+
+# .pth must be transformed into .onnx then .pb
+
+
+@register_model
+def base_patch16_384_gap(pretrained=False, **kwargs):
+    model = VisionTransformer_gap(
+        img_size=384, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(layers.LayerNormalization(), eps=1e-6), **kwargs)
+    model.default_cfg = _cfg()
+    # if pretrained:
+    #     '''download from https://dl.fbaipublicfiles.com/deit/deit_base_patch16_384-8de9b5d1.pth'''
+    #     checkpoint = torch.load(
+    #         './Networks/deit_base_patch16_384-8de9b5d1.pth')
+    #     model.load_state_dict(checkpoint["model"], strict=False)
+    #     print("load transformer pretrained")
+    return model
+
