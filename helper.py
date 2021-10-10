@@ -3,6 +3,48 @@ from tensorflow.keras import layers
 from typing import Callable
 import math
 
+import scipy.spatial
+from PIL import Image
+import scipy.io as io
+import scipy
+import numpy as np
+import h5py
+import cv2
+import random
+import os
+
+def setup_seed(SEED):
+    # torch.manual_seed(SEED)
+    # torch.cuda.manual_seed_all(SEED) # if you are using multi-GPU.
+    # np.random.seed(SEED)
+    # random.seed(SEED)
+    # torch.backends.cudnn.deterministic = True
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    os.environ['PYTHONHASHSEED'] = str(SEED)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    tf.random.set_seed(SEED)
+
+def load_data(img_path, args, train=True):
+
+    gt_path = img_path.replace('.jpg', '.h5').replace('images', 'gt_density_map')
+    img = Image.open(img_path).convert('RGB')
+
+    while True:
+        try:
+            gt_file = h5py.File(gt_path)
+            gt_count = np.asarray(gt_file['gt_count'])
+            break  # Success!
+        except OSError:
+            print("load error:", img_path)
+            cv2.waitKey(1000)  # Wait a bit
+
+    img = img.copy()
+    gt_count = gt_count.copy()
+
+    return img, gt_count
+
+
 
 def named_apply(fn: Callable, module: layers.Layer, name='', depth_first=True, include_root=False) -> layers.Layer:
     if not depth_first and include_root:
