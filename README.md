@@ -13,7 +13,7 @@ https://github.com/dk-liang/TransCrowd
 
 Having little knowledge about license and pt and tf
 
-Tell me if there is any wrong usage plz and thank you more than a thousand times
+Tell me if there was any wrong usage plz and thank you more than a thousand times
 
 owo
 
